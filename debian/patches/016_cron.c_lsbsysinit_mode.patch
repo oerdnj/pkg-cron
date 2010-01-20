@@ -1,0 +1,398 @@
+--- a/cron.c
++++ b/cron.c
+@@ -421,7 +421,7 @@ parse_args(argc, argv)
+ 
+ 	stay_foreground = 0;
+ 
+-	while (EOF != (argch = getopt(argc, argv, "fx:"))) {
++	while (EOF != (argch = getopt(argc, argv, "lfx:"))) {
+ 		switch (argch) {
+ 		default:
+ 			usage();
+@@ -432,6 +432,9 @@ parse_args(argc, argv)
+ 			if (!set_debug_flags(optarg))
+ 				usage();
+ 			break;
++                case 'l':
++			lsbsysinit_mode = 1;
++			break;
+ 		}
+ 	}
+ }
+--- a/cron.h
++++ b/cron.h
+@@ -271,6 +271,8 @@ time_min clockTime;
+ 
+ int	stay_foreground;
+ 
++int	lsbsysinit_mode;
++
+ # if DEBUGGING
+ int	DebugFlags;
+ char	*DebugFlagNames[] = {	/* sync with #defines */
+@@ -283,6 +285,7 @@ extern	char	*copyright[],
+ 		*MonthNames[],
+ 		*DowNames[],
+ 		*ProgramName;
++extern	int	lsbsysinit_mode;
+ extern	int	LineNumber;
+ extern	time_t	StartTime;
+ extern  time_min timeRunning;
+--- a/database.c
++++ b/database.c
+@@ -24,19 +24,37 @@ static char rcsid[] = "$Id: database.c,v
+ 
+ 
+ #include "cron.h"
++#define __USE_GNU /* For O_NOFOLLOW */
+ #include <fcntl.h>
++#undef __USE_GNU
+ #include <sys/stat.h>
+ #include <sys/file.h>
+ 
+ 
+ #define TMAX(a,b) ((a)>(b)?(a):(b))
+ 
++/* Try to get maximum path name -- this isn't really correct, but we're
++   going to be lazy */
++
++#ifndef PATH_MAX
++
++#ifdef MAXPATHLEN
++#define PATH_MAX MAXPATHLEN 
++#else
++#define PATH_MAX 2048
++#endif
++
++#endif /* ifndef PATH_MAX */
+ 
+ static	void		process_crontab __P((char *, char *, char *,
+ 					     struct stat *,
+ 					     cron_db *, cron_db *));
+ 
+ 
++#ifdef DEBIAN
++static int valid_name (char *filename);
++static user *get_next_system_crontab __P((user *));
++#endif
+ void
+ load_database(old_db)
+ 	cron_db		*old_db;
+@@ -47,6 +65,13 @@ load_database(old_db)
+ 	DIR_T   	*dp;
+ 	cron_db		new_db;
+ 	user		*u, *nu;
++#ifdef DEBIAN
++	struct stat     syscrond_stat;
++	struct stat     syscrond_file_stat;
++	
++	char            syscrond_fname[PATH_MAX+1];
++	int             syscrond_change = 0;
++#endif
+ 
+ 	Debug(DLOAD, ("[%d] load_database()\n", getpid()))
+ 
+@@ -64,6 +89,53 @@ load_database(old_db)
+ 	if (stat(SYSCRONTAB, &syscron_stat) < OK)
+ 		syscron_stat.st_mtime = 0;
+ 
++#ifdef DEBIAN
++	/* Check mod time of SYSCRONDIR. This won't tell us if a file
++         * in it changed, but will capture deletions, which the individual
++         * file check won't
++	 */
++	if (stat(SYSCRONDIR, &syscrond_stat) < OK) {
++		log_it("CRON", getpid(), "STAT FAILED", SYSCRONDIR);
++		(void) exit(ERROR_EXIT);
++	}
++
++	/* If SYSCRONDIR was modified, we know that something is changed and
++	 * there is no need for any further checks. If it wasn't, we should
++	 * pass through the old list of files in SYSCRONDIR and check their
++	 * mod time. Therefore a stopped hard drive won't be spun up, since
++	 * we avoid reading of SYSCRONDIR and don't change its access time.
++	 * This is especially important on laptops with APM.
++	 */
++	if (old_db->sysd_mtime != syscrond_stat.st_mtime) {
++	        syscrond_change = 1;
++	} else {
++	        /* Look through the individual files */
++		user *systab;
++
++		Debug(DLOAD, ("[%d] system dir mtime unch, check files now.\n",
++			      getpid()))
++
++		for (systab = old_db->head;
++		     (systab = get_next_system_crontab (systab)) != NULL;
++		     systab = systab->next) {
++
++			sprintf(syscrond_fname, "%s/%s", SYSCRONDIR,
++							 systab->name + 8);
++
++			Debug(DLOAD, ("\t%s:", syscrond_fname))
++
++			if (stat(syscrond_fname, &syscrond_file_stat) < OK)
++				syscrond_file_stat.st_mtime = 0;
++
++			if (syscrond_file_stat.st_mtime != systab->mtime) {
++			        syscrond_change = 1;
++                        }
++
++			Debug(DLOAD, (" [checked]\n"))
++		}
++	}
++#endif /* DEBIAN */
++
+ 	/* if spooldir's mtime has not changed, we don't need to fiddle with
+ 	 * the database.
+ 	 *
+@@ -71,7 +143,14 @@ load_database(old_db)
+ 	 * so is guaranteed to be different than the stat() mtime the first
+ 	 * time this function is called.
+ 	 */
+-	if (old_db->mtime == TMAX(statbuf.st_mtime, syscron_stat.st_mtime)) {
++#ifdef DEBIAN
++	if ((old_db->user_mtime == statbuf.st_mtime) &&
++	    (old_db->sys_mtime == syscron_stat.st_mtime) &&
++	    (!syscrond_change)) {
++#else
++	if ((old_db->user_mtime == statbuf.st_mtime) &&
++	    (old_db->sys_mtime == syscron_stat.st_mtime)) {
++#endif
+ 		Debug(DLOAD, ("[%d] spool dir mtime unch, no load needed.\n",
+ 			      getpid()))
+ 		return;
+@@ -82,15 +161,59 @@ load_database(old_db)
+ 	 * actually changed.  Whatever is left in the old database when
+ 	 * we're done is chaff -- crontabs that disappeared.
+ 	 */
+-	new_db.mtime = TMAX(statbuf.st_mtime, syscron_stat.st_mtime);
++	new_db.user_mtime = statbuf.st_mtime;
++	new_db.sys_mtime = syscron_stat.st_mtime;
++#ifdef DEBIAN
++	new_db.sysd_mtime = syscrond_stat.st_mtime;
++#endif
+ 	new_db.head = new_db.tail = NULL;
+ 
+ 	if (syscron_stat.st_mtime) {
+-		process_crontab("root", "*system*",
++		process_crontab(SYSUSERNAME, "*system*",
+ 				SYSCRONTAB, &syscron_stat,
+ 				&new_db, old_db);
+ 	}
+ 
++#ifdef DEBIAN
++	/* Read all the package crontabs. */
++	if (!(dir = opendir(SYSCRONDIR))) {
++		log_it("CRON", getpid(), "OPENDIR FAILED", SYSCRONDIR);
++		(void) exit(ERROR_EXIT);
++	}
++
++	while (NULL != (dp = readdir(dir))) {
++		char	fname[MAXNAMLEN+1],
++		        tabname[PATH_MAX+1];
++
++
++		/* avoid file names beginning with ".".  this is good
++		 * because we would otherwise waste two guaranteed calls
++		 * to stat() for . and .., and also because package names
++		 * starting with a period are just too nasty to consider.
++		 */
++		if (dp->d_name[0] == '.')
++			continue;
++
++		/* skipfile names with letters outside the set
++		 * [A-Za-z0-9_-], like run-parts.
++		 */
++		if (!valid_name(dp->d_name))
++		  continue;
++
++		/* Generate the "fname" */
++		(void) strcpy(fname,"*system*");
++		(void) strcat(fname, dp->d_name);
++		sprintf(tabname,"%s/%s", SYSCRONDIR, dp->d_name);
++
++		/* statbuf is used as working storage by process_crontab() --
++		   current contents are irrelevant */
++		process_crontab(SYSUSERNAME, fname, tabname,
++				&statbuf, &new_db, old_db);
++
++	}
++	closedir(dir);
++#endif
++
+ 	/* we used to keep this dir open all the time, for the sake of
+ 	 * efficiency.  however, we need to close it in every fork, and
+ 	 * we fork a lot more often than the mtime of the dir changes.
+@@ -102,7 +225,7 @@ load_database(old_db)
+ 
+ 	while (NULL != (dp = readdir(dir))) {
+ 		char	fname[MAXNAMLEN+1],
+-			tabname[MAXNAMLEN+1];
++			tabname[PATH_MAX+1];
+ 
+ 		/* avoid file names beginning with ".".  this is good
+ 		 * because we would otherwise waste two guaranteed calls
+@@ -113,7 +236,7 @@ load_database(old_db)
+ 			continue;
+ 
+ 		(void) strcpy(fname, dp->d_name);
+-		sprintf(tabname, CRON_TAB(fname));
++		snprintf(tabname, PATH_MAX+1, CRON_TAB(fname));
+ 
+ 		process_crontab(fname, fname, tabname,
+ 				&statbuf, &new_db, old_db);
+@@ -203,25 +326,82 @@ process_crontab(uname, fname, tabname, s
+ 	int		crontab_fd = OK - 1;
+ 	user		*u;
+ 
++#ifdef DEBIAN
++	/* If the name begins with *system*, don't worry about password -
++	 it's part of the system crontab */
++	if (strncmp(fname, "*system*", 8) && !(pw = getpwnam(uname))) {
++#else
+ 	if (strcmp(fname, "*system*") && !(pw = getpwnam(uname))) {
++#endif
+ 		/* file doesn't have a user in passwd file.
+ 		 */
+-		log_it(fname, getpid(), "ORPHAN", "no passwd entry");
++		if (strncmp(fname, "tmp.", 4)) {
++			/* don't log these temporary files */
++			log_it(fname, getpid(), "ORPHAN", "no passwd entry");
++		}
+ 		goto next_crontab;
+ 	}
+ 
+-	if ((crontab_fd = open(tabname, O_RDONLY, 0)) < OK) {
++        if (pw) {
++            /* Path for user crontabs (including root's!) */
++            if ((crontab_fd = open(tabname, O_RDONLY|O_NOFOLLOW, 0)) < OK) {
+ 		/* crontab not accessible?
+ 		 */
+ 		log_it(fname, getpid(), "CAN'T OPEN", tabname);
+ 		goto next_crontab;
+-	}
++            }
+ 
+-	if (fstat(crontab_fd, statbuf) < OK) {
++            if (fstat(crontab_fd, statbuf) < OK) {
+ 		log_it(fname, getpid(), "FSTAT FAILED", tabname);
+ 		goto next_crontab;
+-	}
++            }
++            /* Check to make sure that the crontab is owned by the correct user
++               (or root) */
++
++            if (statbuf->st_uid != pw->pw_uid &&
++                statbuf->st_uid != ROOT_UID) {
++                log_it(fname, getpid(), "WRONG FILE OWNER", tabname);
++		goto next_crontab;
++            }
++            if (!S_ISREG(statbuf->st_mode) ||
++                statbuf->st_nlink != 1 ||
++                (statbuf->st_mode & 07777) != 0600) {
++                log_it(fname, getpid(), "WRONG INODE INFO", tabname);
++ 		goto next_crontab;
++            }
++        } else {
++            /* System crontab path. These can be symlinks, but the
++               symlink and the target must be owned by root. */
++            if (lstat(tabname, statbuf) < OK) {
++		log_it(fname, getpid(), "LSTAT FAILED", tabname);
++		goto next_crontab;
++            }
++            if (statbuf->st_uid != ROOT_UID) {
++                log_it(fname, getpid(), "WRONG SYMLINK OWNER", tabname);
++		goto next_crontab;
++            }
++            if ((crontab_fd = open(tabname, O_RDONLY, 0)) < OK) {
++		/* crontab not accessible?
++		 */
++		log_it(fname, getpid(), "CAN'T OPEN", tabname);
++		goto next_crontab;
++            }
+ 
++            if (fstat(crontab_fd, statbuf) < OK) {
++		log_it(fname, getpid(), "FSTAT FAILED", tabname);
++		goto next_crontab;
++            }
++            /* Check to make sure that the crontab is owned by root */
++            if (statbuf->st_uid != ROOT_UID) {
++                log_it(fname, getpid(), "WRONG FILE OWNER", tabname);
++		goto next_crontab;
++            }
++        }
++        /*
++         * The link count check is not sufficient (the owner may
++         * delete their original link, reducing the link count back to
++         * 1), but this is all we've got.
++         */
+ 	Debug(DLOAD, ("\t%s:", fname))
+ 	u = find_user(old_db, fname);
+ 	if (u != NULL) {
+@@ -247,7 +427,8 @@ process_crontab(uname, fname, tabname, s
+ 		free_user(u);
+ 		log_it(fname, getpid(), "RELOAD", tabname);
+ 	}
+-	u = load_user(crontab_fd, pw, fname);
++
++	u = load_user(crontab_fd, pw, uname, fname, tabname);
+ 	if (u != NULL) {
+ 		u->mtime = statbuf->st_mtime;
+ 		link_user(new_db, u);
+@@ -259,3 +440,55 @@ next_crontab:
+ 		close(crontab_fd);
+ 	}
+ }
++
++#ifdef DEBIAN
++
++#include <regex.h>
++
++/* True or false? Is this a valid filename? */
++
++/* Taken from Clint Adams 'run-parts' version to support lsb style
++   names, originally GPL, but relicensed to cron license per e-mail of
++   27 September 2003. I've changed it to do regcomp() only once. */
++
++int valid_name(char *filename)
++{
++  static regex_t hierre, tradre, excsre, classicalre;
++  static int donere = 0;
++
++  if (!donere) {
++      donere = 1;
++      if (regcomp(&hierre, "^_?([a-z0-9_.]+-)+[a-z0-9]+$",
++                  REG_EXTENDED | REG_NOSUB)
++          || regcomp(&excsre, "^[a-z0-9-].*dpkg-(old|dist)$",
++                     REG_EXTENDED | REG_NOSUB)
++          || regcomp(&tradre, "^[a-z0-9][a-z0-9-]*$", REG_NOSUB)
++          || regcomp(&classicalre, "^[a-zA-Z0-9_-]+$",
++                     REG_EXTENDED | REG_NOSUB)) {
++          log_it("CRON", getpid(), "REGEX FAILED", "valid_name");
++          (void) exit(ERROR_EXIT);
++      }
++  }
++  if (lsbsysinit_mode) {
++      if (!regexec(&hierre, filename, 0, NULL, 0)) {
++          return regexec(&excsre, filename, 0, NULL, 0);
++      } else {
++          return !regexec(&tradre, filename, 0, NULL, 0);
++      }
++  }
++  /* Old standard style */
++  return !regexec(&classicalre, filename, 0, NULL, 0);
++}
++
++
++static user *
++get_next_system_crontab (curtab)
++	user	*curtab;
++{
++	for ( ; curtab != NULL; curtab = curtab->next)
++		if (!strncmp(curtab->name, "*system*", 8) && curtab->name [8])
++			break;
++	return curtab;
++}
++
++#endif

@@ -1,0 +1,13 @@
+--- a/cron.c
++++ b/cron.c
+@@ -412,6 +412,10 @@ sigchld_handler(x) {
+ static void
+ sighup_handler(x) {
+ 	log_close();
++
++	/* we should use sigaction for proper signal blocking as this 
++	   has a race, but... */
++	signal(SIGHUP, sighup_handler);
+ }
+ 
+ 

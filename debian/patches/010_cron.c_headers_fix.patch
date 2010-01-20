@@ -1,0 +1,22 @@
+--- a/cron.c
++++ b/cron.c
+@@ -24,13 +24,18 @@ static char rcsid[] = "$Id: cron.c,v 2.1
+ 
+ 
+ #include "cron.h"
+-#include <sys/signal.h>
++#include <signal.h>
+ #if SYS_TIME_H
+ # include <sys/time.h>
+ #else
+ # include <time.h>
+ #endif
+ 
++#include <sys/types.h>
++#include <fcntl.h>
++#ifdef DEBIAN
++#include <sys/stat.h>
++#endif
+ 
+ static	void	usage __P((void)),
+ 		run_reboot_jobs __P((cron_db *)),

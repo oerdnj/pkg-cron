@@ -1,0 +1,90 @@
+--- a/cron.h
++++ b/cron.h
+@@ -239,7 +239,7 @@ char		*env_get __P((char *, char **)),
+ 		**env_copy __P((char **)),
+ 		**env_set __P((char **, char *));
+ 
+-user		*load_user __P((int, struct passwd *, char *)),
++user		*load_user __P((int, struct passwd *, char *, char *, char *)),
+ 		*find_user __P((cron_db *, char *));
+ 
+ entry		*load_entry __P((FILE *, void (*)(),
+--- a/user.c
++++ b/user.c
+@@ -149,17 +149,19 @@ free_user(u)
+ 
+ 
+ user *
+-load_user(crontab_fd, pw, name)
++load_user(crontab_fd, pw, uname, fname, tabname)
+ 	int		crontab_fd;
+ 	struct passwd	*pw;		/* NULL implies syscrontab */
+-	char		*name;
++	char		*uname;
++	char		*fname;
++	char		*tabname;
+ {
+ 	char	envstr[MAX_ENVSTR];
+ 	FILE	*file;
+ 	user	*u;
+ 	entry	*e;
+ 	int	status;
+-	char	**envp;
++	char	**envp = NULL, **tenvp;
+ 
+ 	if (!(file = fdopen(crontab_fd, "r"))) {
+ 		perror("fdopen on crontab_fd in load_user");
+@@ -170,8 +172,15 @@ load_user(crontab_fd, pw, name)
+ 
+ 	/* file is open.  build user entry, then read the crontab file.
+ 	 */
+-	u = (user *) malloc(sizeof(user));
+-	u->name = strdup(name);
++	if ((u = (user *) malloc(sizeof(user))) == NULL) {
++		errno = ENOMEM;
++		return NULL;
++	}
++	if ((u->name = strdup(fname)) == NULL) {
++		free(u);
++		errno = ENOMEM;
++		return NULL;
++	}
+ 	u->crontab = NULL;
+ 
+ #ifdef WITH_SELINUX
+@@ -195,7 +204,11 @@ load_user(crontab_fd, pw, name)
+ 	/* 
+ 	 * init environment.  this will be copied/augmented for each entry.
+ 	 */
+-	envp = env_init();
++	if ((envp = env_init()) == NULL) {
++		free(u->name);
++		free(u);
++		return NULL;
++	}
+ 
+ 	/*
+ 	 * load the crontab
+@@ -211,10 +224,21 @@ load_user(crontab_fd, pw, name)
+ 			if (e) {
+ 				e->next = u->crontab;
+ 				u->crontab = e;
++			} else {
++				/* stop processing on EOF/syntax error */
++				free_user(u);
++				u = NULL;
++				goto done;
+ 			}
+ 			break;
+ 		case TRUE:
+-			envp = env_set(envp, envstr);
++			if ((tenvp = env_set(envp, envstr))) {
++				envp = tenvp;
++			} else {
++				free_user(u);
++				u = NULL;
++				goto done;
++			}
+ 			break;
+ 		}
+ 	}
